@@ -237,18 +237,101 @@ Most failures here are transient (a file not yet copied, a DuckDB lock). Two ret
 
 ## Part D — Data quality dimensions
 
-**TODO.** One table of checks implemented in both pipelines, based on the Part 0 issues log:
+All checks live in **one file, `include/dq_rules.py`**, used by both pipelines. Each rule has a pandas version (ETL) and a DuckDB SQL version (ELT). Running `python include/dq_rules.py` is a parity test: it applies both versions to the same data and confirms they flag exactly the same rows, so ETL and ELT can't drift apart.
 
-| Check name | Dimension | Severity | Applies to | ETL (Python) | ELT (SQL) | Issue ID |
+**Severity → outcome:** Critical → row quarantined (ETL) / `dq_status = 'FAIL'` (ELT). Warning → row loads, issue logged / `dq_status = 'WARN'`.
+**Actions:** QUARANTINE · DEDUPE (extra copies quarantined, one version kept) · REPAIR (row loads, bad attribute set to NULL/UNKNOWN) · STANDARDISE (casing/spaces fixed) · RECONCILE (row loads and appears in the payment reconciliation) · LOG · ALERT (dataset-level).
+
+### Rule catalogue (57 rules)
+
+| Check | File | Dimension | Severity | Action | Rule | Issue |
 |---|---|---|---|---|---|---|
-| | Completeness | | | ✅ | ✅ | |
-| | Uniqueness | | | | | |
-| | Validity | | | | | |
-| | Accuracy | | | | | |
-| | Consistency | | | | | |
-| | Timeliness | | | | | |
+| `customer_id_not_null` | customers | Completeness | Critical | QUARANTINE | customer_id is present | - |
+| `email_present` | customers | Completeness | Warning | LOG | email is present | DI-30 |
+| `city_present` | customers | Completeness | Warning | LOG | city is present | DI-33 |
+| `order_id_not_null` | orders | Completeness | Critical | QUARANTINE | order_id is present | - |
+| `order_customer_id_not_null` | orders | Completeness | Critical | QUARANTINE | customer_id is present | DI-02 |
+| `order_ts_not_null` | orders | Completeness | Critical | QUARANTINE | order_ts is present | DI-03 |
+| `delivered_has_delivery_minutes` | orders | Completeness | Critical | QUARANTINE | DELIVERED orders have delivery_minutes | DI-15 |
+| `payment_id_not_null` | payments | Completeness | Critical | QUARANTINE | payment_id is present | - |
+| `payment_order_id_not_null` | payments | Completeness | Critical | QUARANTINE | order_id is present | - |
+| `gateway_ref_present` | payments | Completeness | Warning | LOG | SUCCESS UPI/Card/Wallet payments have a gateway_ref (COD never does) | DI-26 (revised) |
+| `product_id_not_null` | products | Completeness | Critical | QUARANTINE | product_id is present | - |
+| `category_present` | products | Completeness | Warning | REPAIR | category is present (else UNKNOWN) | DI-37 |
+| `store_id_not_null` | stores | Completeness | Critical | QUARANTINE | store_id is present | - |
+| `customer_id_unique` | customers | Uniqueness | Critical | DEDUPE | one version per customer_id: the LAST row in the file is kept (pending client) | DI-27 |
+| `order_id_unique` | orders | Uniqueness | Critical | DEDUPE | only the first copy of an order_id loads | DI-01 |
+| `payment_id_unique` | payments | Uniqueness | Critical | DEDUPE | only the first copy of a payment_id loads | DI-19 |
+| `product_id_unique` | products | Uniqueness | Critical | DEDUPE | one row per product_id: rows named '(old)' lose, then first by _row | DI-36 |
+| `store_id_unique` | stores | Uniqueness | Critical | DEDUPE | one row per store_id | - |
+| `email_format` | customers | Validity | Warning | LOG | email looks like name@domain.tld | DI-29 |
+| `phone_format` | customers | Validity | Warning | LOG | phone is a 10-digit Indian mobile after removing +91 / 0 | DI-31 |
+| `customer_pincode_format` | customers | Validity | Warning | LOG | pincode is 6 digits | DI-34 |
+| `loyalty_tier_allowed` | customers | Validity | Warning | REPAIR | loyalty_tier is Bronze, Silver, Gold or Platinum (else UNKNOWN) | - |
+| `signup_date_valid` | customers | Validity | Warning | REPAIR | signup_date is a real date (else NULL) | - |
+| `order_ts_valid` | orders | Validity | Critical | QUARANTINE | order_ts is a real ISO-8601 timestamp | DI-04 |
+| `order_status_allowed` | orders | Validity | Critical | QUARANTINE | order_status is DELIVERED, CANCELLED or RETURNED | DI-06 |
+| `order_payment_mode_allowed` | orders | Validity | Critical | QUARANTINE | payment_mode maps to UPI, Card, Cash on Delivery or Wallet | DI-08 |
+| `discount_pct_in_range` | orders | Validity | Critical | QUARANTINE | discount_pct between 0 and 100 (blank = 0) | DI-12 |
+| `order_status_standard` | orders | Validity | Warning | STANDARDISE | order_status already in canonical form | DI-07 |
+| `order_payment_mode_standard` | orders | Validity | Warning | STANDARDISE | payment_mode already in canonical form (no variants or spaces) | DI-09 |
+| `payment_ts_valid` | payments | Validity | Critical | QUARANTINE | payment_ts is a real ISO-8601 timestamp | - |
+| `payment_status_allowed` | payments | Validity | Critical | QUARANTINE | payment_status is SUCCESS, FAILED or REFUNDED | - |
+| `payment_mode_known` | payments | Validity | Warning | REPAIR | payment_mode maps to an allowed value (else loads as UNKNOWN) | DI-24 |
+| `payment_mode_standard` | payments | Validity | Warning | STANDARDISE | payment_mode already in canonical form | DI-25 |
+| `zone_allowed` | stores | Validity | Warning | REPAIR | zone is North, South, East or West (else UNKNOWN) | DI-40 |
+| `store_pincode_format` | stores | Validity | Warning | LOG | pincode is 6 digits | - |
+| `quantity_positive_integer` | orders | Accuracy | Critical | QUARANTINE | quantity is a whole number above 0 | DI-10 |
+| `unit_price_positive` | orders | Accuracy | Critical | QUARANTINE | unit_price above 0 | - |
+| `order_amount_matches_formula` | orders | Accuracy | Critical | QUARANTINE | order_amount = quantity x unit_price x (1 - discount_pct/100), within 0.01 | DI-11 |
+| `delivery_minutes_plausible` | orders | Accuracy | Critical | QUARANTINE | delivery_minutes above 0 and below 120 | DI-16 |
+| `delivery_minutes_normal_range` | orders | Accuracy | Warning | LOG | delivery_minutes inside the normal 8-35 range | - |
+| `success_amount_positive` | payments | Accuracy | Critical | QUARANTINE | a SUCCESS payment is above 0 | DI-22 |
+| `mrp_positive` | products | Accuracy | Warning | REPAIR | mrp above 0 (else NULL) | DI-39 |
+| `cost_price_positive` | products | Accuracy | Warning | REPAIR | cost_price above 0 (else NULL, excluded from margin) | - |
+| `cost_price_not_above_mrp` | products | Accuracy | Warning | REPAIR | cost_price <= mrp (else cost NULL, excluded from margin) | DI-38 |
+| `capacity_positive` | stores | Accuracy | Warning | REPAIR | capacity_orders_per_day above 0 (else NULL) | DI-41 |
+| `loyalty_tier_standard` | customers | Consistency | Warning | STANDARDISE | loyalty_tier uses one casing | DI-32 |
+| `customer_pincode_bengaluru` | customers | Consistency | Warning | LOG | pincode is in Bengaluru (56xxxx) | DI-35 |
+| `order_customer_exists` | orders | Consistency | Critical | QUARANTINE | customer_id exists in customers | - |
+| `order_product_exists` | orders | Consistency | Critical | QUARANTINE | product_id exists in products | DI-13 |
+| `order_store_exists` | orders | Consistency | Critical | QUARANTINE | store_id exists in stores | DI-14 |
+| `delivered_has_success_payment` | orders | Consistency | Warning | RECONCILE | DELIVERED orders have a SUCCESS payment | DI-18 |
+| `payment_order_exists` | payments | Consistency | Critical | QUARANTINE | order_id exists in orders (orphans look like test transactions) | DI-20 |
+| `success_amount_matches_order` | payments | Consistency | Warning | RECONCILE | a SUCCESS payment equals its order's order_amount | DI-21 |
+| `signup_date_not_future` | customers | Timeliness | Warning | REPAIR | signup_date is not after the run date (else NULL) | DI-28 |
+| `order_ts_not_future` | orders | Timeliness | Critical | QUARANTINE | order_ts is not after the run date | DI-05 |
+| `orders_fresh` | orders | Timeliness | Warning | ALERT | the latest order is no more than 1 day older than the run date | - |
+| `payment_ts_not_future` | payments | Timeliness | Critical | QUARANTINE | payment_ts is not after the run date | DI-23 |
 
-Plus a sample query and result from `dq_results`.
+### Coverage: every dimension is checked, in both pipelines
+
+```
+dimension  Accuracy  Completeness  Consistency  Timeliness  Uniqueness  Validity
+file                                                                            
+customers         0             3            2           1           1         5
+orders            5             4            4           2           1         6
+payments          1             3            2           1           1         4
+products          3             2            0           0           1         0
+stores            1             1            0           0           1         2
+```
+
+### Design decisions
+
+- **Master rows are never quarantined for a bad attribute.** Product, customer and store attribute problems are REPAIR, not QUARANTINE, so their orders are never orphaned.
+- **Reconciliation exceptions are not rejects.** `delivered_has_success_payment` and `success_amount_matches_order` are Warnings with action RECONCILE.
+- **No rounding in the formula check.** `order_amount` is compared with the unrounded formula, with a 0.01 tolerance, because pandas and DuckDB round halves differently.
+- **`NOT EXISTS`, not `NOT IN`, for key checks in SQL.** `NOT IN` returns no rows at all if the lookup list contains a NULL, which would silently pass every orphan.
+- **Deduplication rules are explicit:** first copy of an order/payment, last row of a customer (pending client), non-`(old)` row of a product.
+
+### `dq_results` sample
+
+**TODO:** paste a query and result after the first run:
+
+```sql
+SELECT check_name, dimension, severity, rows_checked, rows_failed, status
+FROM dq_results WHERE run_id = '<run_id>' ORDER BY status, check_name;
+```
 
 ---
 
