@@ -164,14 +164,74 @@ Severity: **Critical** rows are quarantined; **Warning** rows load and are logge
 
 ## Part A — ETL pipeline
 
-**TODO.** Describe:
+**Files:** `dags/nammamart_etl_anaz.py` (DAG wiring only) and `include/nammamart_etl.py` (all pipeline logic, testable without Airflow), using the shared rules in `include/dq_rules.py`.
 
-- DAG flow (Extract ×5 in parallel → Validate → Quarantine → Transform → Load → Reconcile → Report → Run audit)
-- Quarantine location and a sample of `failure_reason` values
-- Masking approach for email and phone, with an example
-- Star schema: `etl_fact_orders`, `etl_dim_customer`, `etl_dim_product`, `etl_dim_store`
-- How idempotency is achieved
-- Row counts: extracted / passed / quarantined per file
+### Flow (17 tasks)
+
+```
+extract_orders ─┐                       ┌─ validate_orders ──────────┐
+extract_payments├─(parallel)─────────── ├─ validate_payments         │
+extract_customers                       ├─ validate_customers        ├─ transform → load → reconcile → report → run_audit
+extract_products│                       ├─ validate_products         │                                       (all_done)
+extract_stores ─┤                       ├─ validate_stores           │
+extract_increment (only with load_increment=true) └─ validate_orders_increment ┘
+```
+
+| Step | What it does |
+|---|---|
+| **Extract** | Five files in parallel, read exactly as received (all text). Schema is checked first: a renamed or missing column fails the task loudly instead of loading wrong data. |
+| **Validate** | Applies the shared rules. Each row gets `dq_status` (PASS / WARN / FAIL) and a reason. |
+| **Quarantine** | FAIL rows are written to `include/quarantine/anaz/<file>_failed_<run_id>.csv` exactly as received, with `failure_reason` as the first column. Nothing is dropped silently. |
+| **Transform** | Repairs master-data attributes (zone/category → `UNKNOWN`, invalid MRP/cost/capacity → NULL), masks personal data, joins orders to all three dimensions, derives `order_date`, `net_revenue`, `gross_margin`, `within_15_min`. |
+| **Load** | Star schema in `include/warehouse_anaz.duckdb`. |
+| **Reconcile** | Compares loaded orders with `payments.csv` → `etl_payment_reconciliation`, one row per mismatch with a reason. |
+| **Report** | Builds `etl_daily_zone_revenue` and `etl_category_margin` and prints them in the task log. |
+| **Run audit** | `trigger_rule="all_done"`: writes one row to `pipeline_runs` even when the run fails. |
+
+### Star schema
+
+| Table | Grain | Notes |
+|---|---|---|
+| `etl_fact_orders` | one row per order_id (primary key) | `net_revenue` = order_amount for DELIVERED orders only; `gross_margin` = net_revenue − quantity × cost_price (NULL when cost is unknown); `within_15_min` for DELIVERED orders; `dq_warnings`; lineage columns `_source_file`, `_source_date`, `_run_id`, `_loaded_at` |
+| `etl_dim_customer` | one row per customer_id | `customer_name_masked` (`P*** S***`), `email_masked` (`pr***@example.com`), `phone_masked` (`98******21`); no raw name, email or phone |
+| `etl_dim_product` | one row per product_id | category `UNKNOWN` when blank; cost_price NULL when ≤ 0 or above MRP |
+| `etl_dim_store` | one row per store_id | zone `UNKNOWN` when blank; `manager_name` (personal data) dropped as not needed |
+
+### How the guarantees are met
+
+- **No bad order reaches finance tables:** only PASS and WARN rows are loaded; every Critical failure is quarantined.
+- **No double counting:** duplicate customers and products are resolved before the join, and the join is checked with `validate="many_to_one"`. The task fails if any dimension key is duplicated, instead of silently doubling revenue.
+- **Idempotent load:** dimensions are fully replaced each run. The fact table is loaded per source file: that file's rows are deleted, then upserted on `order_id` (`INSERT … ON CONFLICT DO UPDATE`). Re-running gives identical row counts.
+- **Late corrections are applied and never undone:** each fact row records its source file's business date. An upsert only overwrites a row when the incoming file is the same age or newer, so the 1 October increment turns DELIVERED orders into RETURNED, and re-running September later cannot turn them back.
+- **Data hand-off:** tasks pass small pickle files in `include/tmp/anaz/<run_id>/`; XCom carries only paths and counts.
+- **One DuckDB writer at a time:** only the sequential tasks (load onwards) open the warehouse, and `connect()` waits and retries if the ELT DAG holds DuckDB's single-writer lock.
+
+### Running it
+
+- Scheduled: 09:00 IST, Monday–Saturday.
+- Manual: *Trigger DAG*. For the increment, *Trigger DAG w/ config* with `{"load_increment": true}`.
+- `as_of` (default `2026-10-01`) is the run date used by the timeliness checks.
+
+### Results
+
+First run on the real data: `manual__2026-10-21T23:28:38.831953+00:00` (all 17 tasks green). "Passed" includes the rows with warnings; passed + quarantined = rows in.
+
+| File | Rows in | Passed | Of which with warnings | Quarantined | Quarantined because |
+|---|---|---|---|---|---|
+| orders.csv | 2,412 | 2,308 | 79 | 104 | 107 Critical flags on 104 rows (3 rows broke two rules, e.g. a 250% discount also breaks the amount formula) |
+| payments.csv | 2,228 | 2,199 | 22 | 29 | duplicates 4, zero/negative SUCCESS 10, orphan test batch 8, future-dated 7 |
+| customers.csv | 405 | 400 | 41 | 5 | the older copy of each duplicated customer_id |
+| products.csv | 152 | 150 | 8 | 2 | the two `(old)` catalogue rows |
+| stores.csv | 15 | 15 | 2 | 0 | none: S07 (zone) and S12 (capacity) are repaired, keeping their 311 orders |
+| **Total** | **5,212** | **5,072** | **152** | **140** | |
+
+Every check's row count matches the Part 0 Data Issues Log exactly (for example orders: 18 missing customer_id, 12 duplicates, 18 amount mismatches; payments: 14 amount mismatches sent to reconciliation as warnings).
+
+What the run demonstrates:
+
+- **Master files lose only true duplicates.** 400 customers and 150 products remain, the counts the brief describes. Every attribute problem is repaired, so no order is orphaned.
+- **Reconciliation exceptions stay in the data.** The 72 unpaid deliveries and 14 payment amount mismatches load as warnings and appear in `etl_payment_reconciliation`, instead of being hidden in quarantine.
+- **The narrowed gateway rule holds:** `gateway_ref_present` reports 0 failures, confirming the 285 Cash on Delivery payments were noise (DI-26).
 
 ---
 
