@@ -99,7 +99,7 @@ def nammamart_etl_anaz():
     def report(reconciled: dict) -> dict:
         return etl.report()
 
-    @task(trigger_rule="all_done")             # runs even when something upstream failed
+    @task(trigger_rule="all_done", retries=0)  # runs even when something upstream failed; no retry
     def run_audit(**context) -> dict:
         ti = context["ti"]
 
@@ -110,8 +110,14 @@ def nammamart_etl_anaz():
         validated = [pull(f"validate_{n}") for n in etl.MASTER_FILES + [etl.INCREMENT]]
         loaded = pull("load")
         finished_ok = pull("report") is not None
-        return etl.audit(context["run_id"], context["dag_run"].dag_id, context["dag_run"].start_date,
+        row = etl.audit(context["run_id"], context["dag_run"].dag_id, context["dag_run"].start_date,
                          extracted, validated, loaded, finished_ok)
+        if not finished_ok:
+            # The audit row is written; now fail this task so the whole run shows as FAILED.
+            # (Airflow judges a run by its last task: a green run_audit would make a broken run look green.)
+            raise RuntimeError("Pipeline did not finish: see the failed/upstream_failed tasks. "
+                               "Audit row written with status 'failed'.")
+        return row
 
     # ---- wiring --------------------------------------------------------------
     raw = {n: extract.override(task_id=f"extract_{n}")(n) for n in etl.MASTER_FILES}

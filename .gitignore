@@ -21,3 +21,4 @@ include/quarantine/
 include/tmp/
 include/reports/profiling/data_issues_log.csv
 logs/
+include/data/.nammamart_original/

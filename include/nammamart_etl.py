@@ -80,10 +80,16 @@ def run_dir(run_id: str, work: Path = WORK_DIR) -> Path:
     return p
 
 
-def source_date(name: str, as_of) -> pd.Timestamp:
-    """Business date a file describes: from its name, else the day before the run date."""
+def source_date(name: str, as_of, order_ts: pd.Series | None = None) -> pd.Timestamp:
+    """Business date a file describes: the date in its name; otherwise the date of its latest
+    valid order; otherwise the day before the run date. It never depends on as_of when the
+    data can answer, so running with a different as_of cannot make an old file look newer."""
     m = re.search(r"\d{4}-\d{2}-\d{2}", FILES[name])
-    return pd.Timestamp(m.group(0)) if m else pd.Timestamp(as_of) - pd.Timedelta(days=1)
+    if m:
+        return pd.Timestamp(m.group(0))
+    if order_ts is not None and order_ts.notna().any():
+        return order_ts.max().normalize()
+    return pd.Timestamp(as_of) - pd.Timedelta(days=1)
 
 
 def connect(path: Path | str = WAREHOUSE, timeout_s: int = 300):
@@ -303,7 +309,7 @@ def build_fact(o: pd.DataFrame, dim_c: pd.DataFrame, dim_p: pd.DataFrame, dim_s:
         "within_15_min": (j["delivery_minutes"] <= 15).where(delivered).astype("boolean"),
         "dq_warnings": j["warning_reason"],
         "_source_file": FILES[name],
-        "_source_date": source_date(name, as_of),
+        "_source_date": source_date(name, as_of, j["order_ts"]),
         "_run_id": run_id,
         "_loaded_at": pd.Timestamp.now(tz="UTC").tz_localize(None).floor("s"),
     })

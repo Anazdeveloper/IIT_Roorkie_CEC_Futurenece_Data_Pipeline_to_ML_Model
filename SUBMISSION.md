@@ -1,6 +1,6 @@
 # NammaMart Quick Commerce — ETL & ELT Pipeline Submission
 
-**Learner:** Anaz A
+**Learner:** Anaz
 **Module:** FDAIE Module 2 · Data Engineering Foundations
 **DAGs:** `dags/nammamart_etl_anaz.py`, `dags/nammamart_elt_anaz.py`
 **Warehouse:** `include/warehouse_anaz.duckdb`
@@ -237,18 +237,87 @@ What the run demonstrates:
 
 ## Part B — ELT pipeline
 
-**TODO.** Describe:
+**Files:** `dags/nammamart_elt_anaz.py` (wiring), `include/nammamart_elt.py` (loads raw data, runs SQL files), and every transformation as a `.sql` file in `include/sql/`.
 
-- Raw / staging / mart layers and the SQL file per table in `include/sql/`
-- The MERGE for `orders_2026-10-01_increment.csv`: rows inserted vs updated
-- **ETL vs ELT September totals:**
+### Flow (15 tasks)
 
-| Metric | ETL | ELT | Match? | If not, why |
+```
+extract_orders ─┐
+extract_payments├─(parallel)─→ load_raw → staging_standardise → staging_quality_checks → staging_build
+extract_customers                                                                              │
+extract_products│              run_audit ← compare_with_etl ← build_marts ← merge_increment ← merge_orders
+extract_stores ─┤             (all_done)
+extract_increment (only with load_increment=true)
+```
+
+Python only moves data (read CSV as text → append to raw). Every transformation after that is SQL.
+
+### The three layers
+
+| Layer | Tables | Rule | SQL files |
+|---|---|---|---|
+| **Raw** | `raw_orders` (orders + increment), `raw_payments`, `raw_customers`, `raw_products`, `raw_stores` | All source columns as text, plus `_row`, `_loaded_at`, `_source_file`, `_run_id`. **Append-only:** never cleaned, never deleted. A retried task doesn't load the same file twice for one run. | (loaded by `load_raw`) |
+| **Staging** | `stg_orders`, `stg_payments`, `stg_customers`, `stg_products`, `stg_stores` | Reads only the rows this run loaded. Casts types, standardises values, de-duplicates, masks personal data, repairs master attributes, flags every row with `dq_status` / `failure_reason` / `warning_reason`. **Bad rows stay, flagged FAIL.** | `common/00_macros.sql`, `staging/01_std_*.sql`, `staging/generated/0[2-4]_*.sql`, `staging/05_stg_*.sql`, `staging/06_merge_stg_orders.sql` |
+| **Mart** | `mart_daily_store_kpis`, `mart_category_margin`, `mart_delivery_sla`, `mart_payment_reconciliation`, `mart_top_customers` (+ `mart_payment_mode_revenue`, `mart_rejected_summary`) | Only rows not flagged FAIL. Revenue logic defined once in the view `int_orders_enriched`; every mart reads from it. | `mart/00_int_orders_enriched.sql`, `mart/0[1-7]_mart_*.sql` |
+
+**Same rules as the ETL.** The quality checks are not written twice. `include/dq_rules.py` writes them out as SQL into `include/sql/staging/generated/` (`python include/dq_rules.py --write-sql include/sql/staging/generated`), and `python include/dq_rules.py` proves the SQL and pandas versions flag exactly the same rows. The value-cleaning macros (`00_macros.sql`) mirror `standardise()` in the same file.
+
+**Personal data in staging.** `stg_customers` holds only `customer_name_masked`, `email_masked`, `phone_masked`. Clear text exists only in `raw_customers` and the internal, per-run `stg_customers_std` (see Part E for access control). `manager_name` is not carried into `stg_stores`.
+
+**Guard rails.** `int_orders_enriched` fails the task with a clear error if the join changes the row count (a duplicate dimension key) or a clean order has no matching store, product or customer, instead of silently miscounting revenue.
+
+### Incremental load: the MERGE (`staging/06_merge_stg_orders.sql`)
+
+- **Raw:** the increment's rows are appended to `raw_orders` with `_source_file = orders_2026-10-01_increment.csv`.
+- **Staging:** the batch is upserted into `stg_orders` with `INSERT … ON CONFLICT (stg_key) DO UPDATE` (DuckDB's upsert, i.e. MERGE):
+  - **Key:** `order_id` for rows that passed; `'<file>#<row>'` for rejected rows, so a bad copy stays visible without overwriting the real order.
+  - **New orders are inserted; corrections overwrite the old row**, but only when the incoming file is the same age or newer (`_source_date`, taken from the file name). So the 1 October `DELIVERED → RETURNED` corrections are applied, and **re-running September afterwards cannot undo them**.
+  - The task log prints `inserted_new`, `rewritten_same_file`, `updated_by_newer_file` and `kept_newer_version`.
+
+**TODO:** paste the `merge_increment` log line from your increment run (expected: 150 inserted, 10 updated by newer file).
+
+### ETL vs ELT September totals
+
+The `compare_with_etl` task checks this on every run: totals, revenue by zone, margin by category and reconciliation rows by reason, printing `ETL and ELT MATCH` or the rows that differ.
+
+First ELT run on the real data, `manual__2026-10-22T00:42:44.550844+00:00`, compared with the ETL run from Part A. The `compare_with_etl` task printed **`RESULT: ETL and ELT MATCH`**.
+
+| Metric (orders before 2026-10-01) | ETL | ELT | Match? |
+|---|---|---|---|
+| Orders loaded (passed critical checks) | 2,308 | 2,308 | ✅ |
+| Delivered orders | 2,086 | 2,086 | ✅ |
+| Net revenue | 1,134,962.80 | 1,134,962.80 | ✅ |
+| Gross margin | 266,808.95 | 266,808.95 | ✅ |
+| Rows rejected (all files) | 140 | 140 | ✅ |
+
+Detail, also identical in both pipelines:
+
+| Net revenue by zone | ₹ | | Gross margin by category | ₹ |
 |---|---|---|---|---|
-| Delivered orders | | | | |
-| Net revenue | | | | |
-| Gross margin | | | | |
-| Rows rejected | | | | |
+| West | 292,396.65 | | Staples | 62,906.27 |
+| East | 291,804.25 | | Household | 51,031.69 |
+| South | 241,228.80 | | Dairy & Bakery | 44,791.84 |
+| North | 226,807.50 | | Personal Care | 44,752.98 |
+| UNKNOWN (store S07, zone blank) | 82,725.60 | | Snacks & Beverages | 37,665.60 |
+| | | | Fruits & Vegetables | 21,096.62 |
+| | | | UNKNOWN (category blank) | 4,563.95 |
+
+| Reconciliation reason | Rows (both) |
+|---|---|
+| PAYMENT_FAILED | 42 |
+| NO_PAYMENT_RECORD | 27 |
+| AMOUNT_MISMATCH | 13 |
+| ORPHAN_PAYMENT (the test batch, DI-20) | 8 |
+| PAYMENT_FOR_REJECTED_ORDER | 90 |
+
+Notes on these numbers:
+
+- **Why 69 unpaid deliveries, not Part 0's 72:** 3 of the 72 orders also failed a critical check (so they are not reportable revenue). Their payments now appear under `PAYMENT_FOR_REJECTED_ORDER`, together with the payments of all other quarantined orders. The same applies to the 14 → 13 amount mismatches.
+- **The UNKNOWN zone carries ₹82,725.60** (about 7% of revenue): store S07's orders. Had S07 been quarantined for its blank zone, as the brief's suggested severity implies, this revenue would have vanished from every report. Repairing the attribute keeps it, visibly labelled, until ops confirm S07's zone.
+
+**Why they match:** both pipelines use the same rules (`dq_rules.py`), the same cleaning definitions, the same de-duplication choices and the same revenue formulas. The only way they can differ is if one has loaded the increment and the other hasn't; the compare task detects that and says so.
+
+**Where they legitimately differ:** in ELT, `raw_*` grows on every run (Experiment 2), and rejected rows remain queryable in staging with their reasons; in ETL they exist only in the quarantine CSV files.
 
 ---
 
@@ -433,15 +502,15 @@ FROM dq_results WHERE run_id = '<run_id>' ORDER BY status, check_name;
 | # | Experiment | Expected | Observed (ETL) | Observed (ELT) | Where I saw it | What I would change |
 |---|---|---|---|---|---|---|
 | 1 | Happy path | | | | | |
-| 2 | Re-run (idempotency) | | | | | |
-| 3 | Incremental load | | | | | |
-| 4 | Missing source file | | | | | |
+| 2 | Re-run (idempotency) | Reporting tables unchanged; ELT raw grows | Two runs (manual + scheduled `scheduled__2026-10-21T03:30`): both write 5,212 extracted / 2,308 loaded / 140 quarantined. Fact table still 2,308 rows after the second run (confirmed by `compare_with_etl`: orders_loaded = 2,308), not 4,616 | Two runs, identical `pipeline_runs` rows. `raw_orders` grew to **4,824 rows from 2 runs** (2 × 2,412); `stg_orders` still **2,412 rows**; `merge_orders` log: every row `rewritten_same_file`, 0 inserted | `pipeline_runs`; `raw_orders` / `stg_orders` row counts; `merge_orders` and `load` task logs | Correct as designed. Raw growing is intended: it is the append-only audit history. Retention (Part E6) must bound it; I would add a raw-size line to `pipeline_runs` |
+| 3 | Incremental load | 150 new orders inserted, 10 status corrections applied, no duplicates; both pipelines still match | `load` log: orders.csv 2,308 `rewritten_same_file`; increment **150 inserted_new, 10 updated_by_newer_file**; `etl_fact_orders` **2,308 → 2,458** rows. September delivered orders 2,086 → 2,076. Same reporting row count as ELT: 2,562 staged − 104 rejected = 2,458 | `merge_increment`: 160 rows in batch, 0 rejected, **150 inserted_new, 10 updated_by_newer_file**; `stg_orders` 2,412 → 2,562. `compare_with_etl`: **ETL and ELT MATCH**; September net revenue ₹1,134,962.80 → **₹1,130,769.10** (−₹4,193.70, the 10 returned orders) | `merge_increment` and `compare_with_etl` task logs; `stg_orders` by source file | Reconciliation now shows **177 NO_PAYMENT_RECORD** (was 27) and **10 REFUND_MISSING** (was 0): the 1 October orders' payments and the refunds for the 10 returns are not in the September payments file. That is a timing gap, not missing money. I would label orders newer than the latest payment file as `PAYMENT_PENDING`, and load a daily payments increment alongside the orders increment |
+| 4 | Missing source file | `extract_products` retries, then fails; everything downstream `upstream_failed`; `run_audit` still runs; the run is marked failed | `extract_products`: **up_for_retry** after 2 s (try 1, 07:08), retried at 5-minute intervals, **failed** after try 3 (`FileNotFoundError: Source file missing: …/products.csv`); the other 4 extracts succeeded; all 12 later tasks **upstream_failed**; `run_audit` **succeeded** and wrote `status = failed` to `pipeline_runs`. Run took about 10 min. **But the run itself was marked ✓ success** (DAG overview: Failed Task 1, Failed Runs 0) | Same as ETL: `extract_products` failed after 3 tries, 9 downstream tasks `upstream_failed`, `run_audit` green, **run marked ✓ success**, about 10 min | Grid view (task colours), task **Logs** (one per try), DAG **Overview** (Failed Task / Failed Runs counters), `pipeline_runs` | **Fixed:** Airflow judges a run by its last task, and `run_audit` (trigger rule `all_done`) succeeded, so a broken run looked green. `run_audit` now writes its row and then fails on purpose (retries off) when the pipeline didn't finish, so the run turns red. Also: alert on failure (Slack bonus); the 10-minute retry window is acceptable for a late file, but a 08:45 file check would warn before the 09:00 run |
 | 5 | New bad data | | | | | |
 | 6 | Schema change | | | | | |
 | 7 | Volume anomaly | | | | | |
 | 8 | Distribution drift | | | | | |
 | 9 | Freshness | | | | | |
-| 10 | Recovery | | | | | |
+| 10 | Recovery | After restoring `products.csv`, **Clear** on the failed task (with Downstream) re-runs only that task and the tasks after it, inside the same run | ETL run `manual__2026-10-22T01:38:55`: Clear dialog listed **12 affected tasks** (`extract_products` + 11 downstream) out of 17; the 5 other extract tasks were not re-run. `extract_products` succeeded on **try 4** ("Extracted 152 rows from products.csv"), the downstream tasks ran for the first time, and the run turned green | ELT run `manual__2026-10-22T01:46:10`: same result. `extract_products` tries 1–3 ✕, **try 4 ✓**; `load_raw` → `run_audit` re-ran; the other extracts kept their original try 1 | Clear dialog ("Affected Tasks"), task **Task Tries** row (1 ✕ 2 ✕ 3 ✕ 4 ✓), Grid view of the repaired run, `pipeline_runs` (the same run_id's row overwritten, so no duplicate audit rows) | Recovery is cheap because every task is idempotent: re-running reprocesses the run without duplicating rows. Two improvements: an alert at the moment of failure, so recovery starts before 9:30 instead of when someone notices; and a short runbook ("restore file → Clear failed task with Downstream") so anyone on the ops team can do it |
 
 **Five pillars of observability:**
 
