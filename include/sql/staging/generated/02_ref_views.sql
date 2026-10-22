@@ -18,3 +18,10 @@ CREATE OR REPLACE VIEW ref_products AS
 
 CREATE OR REPLACE VIEW ref_stores AS
             SELECT DISTINCT store_id FROM stg_stores_std WHERE store_id IS NOT NULL;
+
+CREATE OR REPLACE VIEW ref_product_mrp AS
+            SELECT product_id, mrp FROM stg_products_std
+            WHERE product_id IS NOT NULL
+            QUALIFY row_number() OVER (PARTITION BY product_id ORDER BY
+                    CASE WHEN product_name LIKE '%(old)' THEN 1 ELSE 0 END, _row) = 1
+                AND mrp > 0;

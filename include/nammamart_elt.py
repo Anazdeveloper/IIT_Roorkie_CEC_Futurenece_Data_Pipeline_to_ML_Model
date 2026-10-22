@@ -22,10 +22,11 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from include import nammamart_etl as etl
+    from include import nammamart_etl as etl, observability
     from include.dq_rules import FILES
 except ImportError:
     import nammamart_etl as etl
+    import observability
     from dq_rules import FILES
 
 INCLUDE = Path(__file__).resolve().parent
@@ -341,9 +342,28 @@ def compare_with_etl(as_of: str, warehouse: Path = WAREHOUSE) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 5b. Run-level observability checks (same thresholds as the ETL)
+# ---------------------------------------------------------------------------
+def observe(run_id: str, dag_id: str, warehouse: Path = WAREHOUSE) -> dict:
+    rid = run_id.replace("'", "''")
+    con = etl.connect(warehouse)
+    try:
+        rows_loaded = con.execute("SELECT count(*) FROM stg_orders WHERE _run_id = ? AND dq_status <> 'FAIL'",
+                                  [run_id]).fetchone()[0]
+        return observability.run_checks(
+            con, run_id, dag_id, rows_loaded=int(rows_loaded),
+            orders_sql=("SELECT store_id, order_status, net_revenue, gross_margin "
+                        f"FROM int_orders_enriched WHERE _run_id = '{rid}'"),
+            stores_sql="SELECT store_id FROM stg_stores WHERE dq_status <> 'FAIL'")
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
 # 6. Run audit
 # ---------------------------------------------------------------------------
-def audit(run_id: str, dag_id: str, start_time, raw_info: dict | None, finished_ok: bool) -> dict:
+def audit(run_id: str, dag_id: str, start_time, raw_info: dict | None, finished_ok: bool,
+          status: str | None = None) -> dict:
     """One pipeline_runs row. rows_loaded = orders that reached the reporting layer in this run;
     rows_quarantined = rows flagged FAIL in staging in this run."""
     loaded = rejected = 0
@@ -364,4 +384,4 @@ def audit(run_id: str, dag_id: str, start_time, raw_info: dict | None, finished_
         print(f"Could not count staged rows: {e}")
     extracted = [{"rows": raw_info["rows_extracted"]}] if raw_info else []
     return etl.audit(run_id, dag_id, start_time, extracted, [{"rows_quarantined": int(rejected)}],
-                     {"rows_loaded": int(loaded)}, finished_ok)
+                     {"rows_loaded": int(loaded)}, finished_ok, status=status)

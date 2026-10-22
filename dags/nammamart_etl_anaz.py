@@ -13,6 +13,8 @@
   Email, phone and name are masked. Re-running never double-counts.
 * Builds `etl_payment_reconciliation`, `etl_daily_zone_revenue`,
   `etl_category_margin`, and writes `dq_results` and `pipeline_runs`.
+* Run-level checks (volume, store distribution, margin) turn the run red when
+  today's numbers are suspect (`include/observability.py`).
 
 Runs at **09:00 IST, Monday to Saturday**. Pipeline logic: `include/nammamart_etl.py`.
 """
@@ -99,6 +101,10 @@ def nammamart_etl_anaz():
     def report(reconciled: dict) -> dict:
         return etl.report()
 
+    @task(retries=0)  # an anomaly in the data won't go away by retrying: report it at once
+    def observability_checks(loaded: dict, reported: dict, **context) -> dict:
+        return etl.observe(loaded, context["run_id"], context["dag_run"].dag_id)
+
     @task(trigger_rule="all_done", retries=0)  # runs even when something upstream failed; no retry
     def run_audit(**context) -> dict:
         ti = context["ti"]
@@ -109,12 +115,17 @@ def nammamart_etl_anaz():
         extracted = [pull(f"extract_{n}") for n in etl.MASTER_FILES] + [pull("extract_increment")]
         validated = [pull(f"validate_{n}") for n in etl.MASTER_FILES + [etl.INCREMENT]]
         loaded = pull("load")
-        finished_ok = pull("report") is not None
+        finished = pull("report") is not None
+        checked = pull("observability_checks") is not None
+        status = "success" if finished and checked else ("anomaly" if finished else "failed")
         row = etl.audit(context["run_id"], context["dag_run"].dag_id, context["dag_run"].start_date,
-                         extracted, validated, loaded, finished_ok)
-        if not finished_ok:
+                        extracted, validated, loaded, finished, status=status)
+        if status != "success":
             # The audit row is written; now fail this task so the whole run shows as FAILED.
             # (Airflow judges a run by its last task: a green run_audit would make a broken run look green.)
+            if status == "anomaly":
+                raise RuntimeError("Pipeline finished but a critical observability check failed: today's numbers "
+                                   "are suspect (see observability_checks). Audit row written with status 'anomaly'.")
             raise RuntimeError("Pipeline did not finish: see the failed/upstream_failed tasks. "
                                "Audit row written with status 'failed'.")
         return row
@@ -131,7 +142,8 @@ def nammamart_etl_anaz():
     transformed = transform(*val_args)
     loaded = load(transformed, *val_args)
     reconciled = reconcile(loaded, val["orders"], val["payments"], val[etl.INCREMENT])
-    report(reconciled) >> run_audit()
+    reported = report(reconciled)
+    observability_checks(loaded, reported) >> run_audit()
 
 
 nammamart_etl_anaz()

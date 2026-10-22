@@ -248,7 +248,15 @@ def build_context(std: dict[str, pd.DataFrame], as_of: str | pd.Timestamp) -> di
         "product_ids": set(std["products"]["product_id"].dropna()),
         "store_ids": set(std["stores"]["store_id"].dropna()),
         "success_order_ids": set(p.loc[success, "order_id"].dropna()),
+        "product_mrp": _current_mrp(std["products"]),
     }
+
+
+def _current_mrp(pr: pd.DataFrame) -> pd.Series:
+    """MRP of the current catalogue row per product (the row product_id_unique keeps); MRP <= 0 ignored."""
+    keep = pr[~_dup_product(pr, None) & pr["product_id"].notna()]
+    keep = keep[(keep["mrp"] > 0).fillna(False)]
+    return pd.Series(keep["mrp"].to_numpy(), index=keep["product_id"].to_numpy())
 
 
 def sql_reference_views(tables: dict[str, str], prefix: str = "ref_") -> list[str]:
@@ -271,6 +279,12 @@ def sql_reference_views(tables: dict[str, str], prefix: str = "ref_") -> list[st
             SELECT DISTINCT product_id FROM {t['products']} WHERE product_id IS NOT NULL""",
         f"""CREATE OR REPLACE VIEW {prefix}stores AS
             SELECT DISTINCT store_id FROM {t['stores']} WHERE store_id IS NOT NULL""",
+        f"""CREATE OR REPLACE VIEW {prefix}product_mrp AS
+            SELECT product_id, mrp FROM {t['products']}
+            WHERE product_id IS NOT NULL
+            QUALIFY row_number() OVER (PARTITION BY product_id ORDER BY
+                    CASE WHEN product_name LIKE '%(old)' THEN 1 ELSE 0 END, _row) = 1
+                AND mrp > 0""",
     ]
 
 
@@ -409,6 +423,12 @@ RULES: list[Rule] = [
       lambda d, c: d["store_id"].notna() & ~d["store_id"].isin(c["store_ids"]),
       "t.store_id IS NOT NULL AND NOT EXISTS "
       "(SELECT 1 FROM $ref_stores r WHERE r.store_id = t.store_id)"),
+    R("unit_price_not_above_mrp", "orders", "Consistency", "Warning", "LOG",
+      "unit_price not above the product's current MRP (invalid MRPs ignored)", "DI-17 (restored)",
+      lambda d, c: (d["unit_price"]
+                    > d["product_id"].map(c["product_mrp"]).astype("Float64") + AMOUNT_TOLERANCE).fillna(False),
+      f"EXISTS (SELECT 1 FROM $ref_product_mrp r WHERE r.product_id = t.product_id "
+      f"AND t.unit_price > r.mrp + {AMOUNT_TOLERANCE})"),
     R("delivered_has_success_payment", "orders", "Consistency", "Warning", "RECONCILE",
       "DELIVERED orders have a SUCCESS payment", "DI-18",
       lambda d, c: (_is(d["order_status"], "DELIVERED") & d["order_id"].notna()
@@ -669,7 +689,8 @@ def _params(ctx_or_as_of, table: str, ref_prefix: str = "ref_") -> dict:
         "next_day": next_day,
         "stale_before": stale_before,
         "table": table,
-        **{f"ref_{k}": f"{ref_prefix}{k}" for k in ("orders", "payments", "customers", "products", "stores")},
+        **{f"ref_{k}": f"{ref_prefix}{k}" for k in ("orders", "payments", "customers", "products", "stores",
+                                                     "product_mrp")},
     }
 
 

@@ -31,8 +31,10 @@ import numpy as np
 import pandas as pd
 
 try:  # inside Airflow / from the project root
+    from include import observability
     from include.dq_rules import FILES, apply_flags, build_context, dq_results, read_raw, standardise
 except ImportError:  # when run from inside include/
+    import observability
     from dq_rules import FILES, apply_flags, build_context, dq_results, read_raw, standardise
 
 LEARNER = "anaz"
@@ -565,10 +567,29 @@ def report(warehouse: Path = WAREHOUSE) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 6b. Run-level observability checks (volume, store distribution, margin)
+# ---------------------------------------------------------------------------
+def observe(loaded: dict, run_id: str, dag_id: str, warehouse: Path = WAREHOUSE) -> dict:
+    rid = run_id.replace("'", "''")
+    con = connect(warehouse)
+    try:
+        return observability.run_checks(
+            con, run_id, dag_id, rows_loaded=int(loaded["rows_loaded"]),
+            orders_sql=("SELECT store_id, order_status, net_revenue, gross_margin "
+                        f"FROM etl_fact_orders WHERE _run_id = '{rid}'"),
+            stores_sql="SELECT store_id FROM etl_dim_store")
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
 # 7. Run audit
 # ---------------------------------------------------------------------------
 def audit(run_id: str, dag_id: str, start_time, extracted: list, validated: list,
-          loaded: dict | None, finished_ok: bool, warehouse: Path = WAREHOUSE) -> dict:
+          loaded: dict | None, finished_ok: bool, warehouse: Path = WAREHOUSE,
+          status: str | None = None) -> dict:
+    """status: 'success', 'failed', or 'anomaly' (pipeline finished but a critical
+    run-level check says the numbers are suspect). Defaults from finished_ok."""
     row = {
         "run_id": run_id, "dag_id": dag_id,
         "start_time": pd.Timestamp(start_time).tz_convert("UTC").tz_localize(None)
@@ -577,7 +598,7 @@ def audit(run_id: str, dag_id: str, start_time, extracted: list, validated: list
         "rows_extracted": int(sum(e["rows"] for e in extracted if e)),
         "rows_loaded": int(loaded["rows_loaded"]) if loaded else 0,
         "rows_quarantined": int(sum(v["rows_quarantined"] for v in validated if v)),
-        "status": "success" if finished_ok else "failed",
+        "status": status or ("success" if finished_ok else "failed"),
     }
     con = connect(warehouse)
     try:

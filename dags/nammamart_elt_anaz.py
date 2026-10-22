@@ -11,6 +11,8 @@
   `stg_orders` is upserted (MERGE) on `order_id`; the 1 October increment updates
   returned orders and adds new ones.
 * **Mart** (`mart_*`): SQL only. Business tables for the six questions.
+* Run-level checks (volume, store distribution, margin) turn the run red when
+  today's numbers are suspect (`include/observability.py`).
 
 All SQL lives in `include/sql/`. The quality rules are shared with the ETL DAG through
 `include/dq_rules.py` (`include/sql/staging/generated/`). Runs at **09:00 IST, Monday to Saturday**.
@@ -107,6 +109,10 @@ def nammamart_elt_anaz():
     def compare_with_etl(marts: dict, **context) -> dict:
         return elt.compare_with_etl(context["params"]["as_of"])
 
+    @task(retries=0)  # an anomaly in the data won't go away by retrying: report it at once
+    def observability_checks(marts: dict, **context) -> dict:
+        return elt.observe(context["run_id"], context["dag_run"].dag_id)
+
     @task(trigger_rule="all_done", retries=0)  # runs even when something upstream failed; no retry
     def run_audit(**context) -> dict:
         ti = context["ti"]
@@ -115,12 +121,18 @@ def nammamart_elt_anaz():
             got = [ti.xcom_pull(task_ids=f"extract_{n}") for n in elt.BASE_FILES] + \
                   [ti.xcom_pull(task_ids="extract_increment")]
             raw_info = {"rows_extracted": sum(g["rows"] for g in got if g)}
-        finished_ok = ti.xcom_pull(task_ids="compare_with_etl") is not None
+        finished = (ti.xcom_pull(task_ids="build_marts") is not None
+                    and ti.xcom_pull(task_ids="compare_with_etl") is not None)
+        checked = ti.xcom_pull(task_ids="observability_checks") is not None
+        status = "success" if finished and checked else ("anomaly" if finished else "failed")
         row = elt.audit(context["run_id"], context["dag_run"].dag_id, context["dag_run"].start_date,
-                         raw_info, finished_ok)
-        if not finished_ok:
+                        raw_info, finished, status=status)
+        if status != "success":
             # The audit row is written; now fail this task so the whole run shows as FAILED.
             # (Airflow judges a run by its last task: a green run_audit would make a broken run look green.)
+            if status == "anomaly":
+                raise RuntimeError("Pipeline finished but a critical observability check failed: today's numbers "
+                                   "are suspect (see observability_checks). Audit row written with status 'anomaly'.")
             raise RuntimeError("Pipeline did not finish: see the failed/upstream_failed tasks. "
                                "Audit row written with status 'failed'.")
         return row
@@ -130,7 +142,10 @@ def nammamart_elt_anaz():
     loaded = load_raw(*raw)
     staged = staging_build(staging_quality_checks(staging_standardise(loaded)))
     merged = merge_increment(merge_orders(staged))
-    compare_with_etl(build_marts(merged)) >> run_audit()
+    marts = build_marts(merged)
+    checked = observability_checks(marts)
+    compared = compare_with_etl(marts)
+    compared >> checked >> run_audit()        # one at a time: DuckDB allows a single writer
 
 
 nammamart_elt_anaz()
